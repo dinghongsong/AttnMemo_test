@@ -10,11 +10,13 @@ import sys
 from models.modeling_deepseek import DeepseekForCausalLM
 from models.modeling_qwen2_moe import Qwen2MoeForCausalLM
 from models.modeling_olmoe import OlmoeForCausalLM
+from models.modeling_llama import LlamaForCausalLM
+from models.configuration_llama import LlamaConfig
 
 import os
 from sklearn.decomposition import PCA
 
-def load_pretrained_model(base_model, model_type) -> tuple:
+def load_pretrained_model(base_model, model_type, is_attn_memo, collect_hiddenstates_apms, save_dir) -> tuple:
     """ Loads a pretrained model from HuggingFace.
 
     Args:
@@ -38,6 +40,14 @@ def load_pretrained_model(base_model, model_type) -> tuple:
     tokenizer.pad_token_id = 0 
     tokenizer.padding_side = "left"
 
+    # configuration
+    config = LlamaConfig.from_pretrained(base_model)
+    config.is_attn_memo=is_attn_memo
+    config.collect_hiddenstates_apms=collect_hiddenstates_apms
+    config.save_dir=save_dir
+    config.threshold=0.99
+    config.training_epoch=6
+
     # Load the model based on the specified model type
     if model_type == 'deepseek-moe':
         model = DeepseekForCausalLM.from_pretrained(
@@ -51,6 +61,11 @@ def load_pretrained_model(base_model, model_type) -> tuple:
         model = Qwen2MoeForCausalLM.from_pretrained(
             base_model,
             quantization_config=nf4_config
+        )
+    elif model_type == 'meta-llama':
+        model = LlamaForCausalLM.from_pretrained(
+            base_model,
+            config=config
         )
     elif model_type == 'OLMoE':
         model = OlmoeForCausalLM.from_pretrained(
@@ -78,9 +93,18 @@ class MOEE(torch.nn.Module):
         is_inference: bool = True,
         embed_eos: str = "",
         attn: str = 'bbcc',
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        # device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        device: str = "cpu",
         use_4bit: bool = True,
         nf4_config = None,
+        ##############
+        is_attn_memo: bool = False,
+        collect_hiddenstates_apms: bool = False,
+        save_dir = None,
+        threshold=0.99,
+        training_epoch=6,
+        unreplace_layer=0,
+        #################
         **kwargs, # Passed to the model, e.g. `attn_implementation`, `torch_dtype` etc.
     ) -> None:
         super().__init__()
@@ -93,8 +117,28 @@ class MOEE(torch.nn.Module):
             self.model, self.tokenizer = load_pretrained_model(model_name_or_path, 'Qwen')
         elif 'OLMoE' in model_name_or_path:
             self.model, self.tokenizer = load_pretrained_model(model_name_or_path, 'OLMoE')
+        elif 'meta-llama' in model_name_or_path:
+            # Load the tokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+            self.tokenizer.pad_token_id = 0 
+            self.tokenizer.padding_side = "left"
+
+            # configuration
+            self.config = LlamaConfig.from_pretrained(model_name_or_path)
+            self.config.is_attn_memo=is_attn_memo
+            self.config.collect_hiddenstates_apms=collect_hiddenstates_apms
+            self.config.save_dir=save_dir
+            self.config.threshold=threshold
+            self.config.training_epoch=training_epoch
+            self.config.unreplace_layer=unreplace_layer
+            
+            # Load the Llama model
+            self.model = LlamaForCausalLM.from_pretrained(model_name_or_path,config=self.config)
+            self.model.eval()
             
         print('self.model: ', self.model)
+        self.model = self.model.to(device)
+        
 
         if hasattr(self.model, 'model'): # LLama2 & Mistral
             self.embedding_attr = 'model'
@@ -137,7 +181,7 @@ class MOEE(torch.nn.Module):
         self,
         sentences: Union[List[str], str],
         batch_size: int = 256,
-        max_length: int = 512,
+        max_length: int = 128,
         instruction: str = "",
         embed_instruction: bool = False,
         get_cache: bool = False,
@@ -158,19 +202,16 @@ class MOEE(torch.nn.Module):
         all_embeddings, all_kv_caches = [], []
         all_default, all_moe_rw = [], []
         for start_index in tqdm(range(0, len(sentences), batch_size), desc="Batches", disable=len(sentences)<256):
+            print("batch idx: ", start_index)
+            
+            # if start_index + batch_size > 128:
+            #     break
+
             sentences_batch = [
                 instruction + s + self.embed_eos for s in sentences[start_index:start_index + batch_size]
             ]
 
-            inputs = self.tokenizer(
-                sentences_batch,
-                padding=True,
-                truncation=True,
-                return_tensors='pt',
-                max_length=max_length,
-                add_special_tokens=add_special_tokens,
-            ).to(self.device)
-            
+
             if kwargs['embed_method'] == 'prompteol':
                 prompt_templates = ["This sentence : \"*sent 0*\" means in one word:\""]
             elif kwargs['embed_method'] == 'none':
@@ -207,73 +248,114 @@ class MOEE(torch.nn.Module):
                 for prompt in prompt_templates:
                     prompts.append(prompt.replace('*sent 0*', sent).replace('_', ' ').strip())
             
-            prompts = self.tokenizer(prompts, padding=True, return_tensors="pt")
+            prompts = self.tokenizer(prompts, 
+                                    padding="max_length",
+                                    truncation=True,
+                                    return_tensors='pt',
+                                    max_length=max_length,
+                                    add_special_tokens=add_special_tokens,
+                                ).to(self.device)
 
-            if get_cache:
-                inputs['use_cache'] = True               
-                
-            outputs, sent_emb = self.model(**prompts, output_hidden_states=True, return_dict=True)                    
-            sent_emb = sent_emb.cpu()
+            outputs = self.model(**prompts, output_hidden_states=True, return_dict=True)                    
+        
             
-            lst_token_emb = outputs.hidden_states[-1][:, -1, :].cpu()
+            embeddings = outputs.hidden_states[-1][:, -1, :].cpu()# [25,128, 63, 2048] -> [128, 2048]
             
-            lst_token_rw = sent_emb[:, :, -1, :]
-            lst_token_rw = torch.cat([lst_token_rw[:, i, :] for i in range(lst_token_rw.shape[1])], dim=1)
-            
-            if kwargs['emb_info'] == 'HS':
-                embeddings = lst_token_emb
-            elif kwargs['emb_info'] == 'RW':
-                embeddings = lst_token_rw
-            elif kwargs['emb_info'] == 'MoEE':
-                embeddings = torch.cat([lst_token_emb, lst_token_rw], dim=1)
-                
-            if kwargs['emb_info'] != 'HS':  
-                mean = embeddings.mean(dim=0, keepdim=True)
-                std = embeddings.std(dim=0, keepdim=True)
-                embeddings = (embeddings - mean) / (std + 1e-8)
-                
-                mean = lst_token_emb.mean(dim=0, keepdim=True)
-                std = lst_token_emb.std(dim=0, keepdim=True)
-                lst_token_emb = (lst_token_emb - mean) / (std + 1e-8)
-                
-                mean = lst_token_rw.mean(dim=0, keepdim=True)
-                std = lst_token_rw.std(dim=0, keepdim=True)
-                lst_token_rw = (lst_token_rw - mean) / (std + 1e-8)
+            mean = embeddings.mean(dim=0, keepdim=True)
+            std = embeddings.std(dim=0, keepdim=True)
+            embeddings = (embeddings - mean) / (std + 1e-8)
 
             all_embeddings.append(embeddings.cpu().numpy())
-            all_default.append(lst_token_emb.cpu().numpy())
-            all_moe_rw.append(lst_token_rw.cpu().numpy())
 
-        try:
-            all_embeddings = torch.cat(all_embeddings, dim=0)
-            all_default = torch.cat(all_default, dim=0)
-            all_moe_rw = torch.cat(all_moe_rw, dim=0)
-        except:
-            all_embeddings = np.concatenate(all_embeddings, axis=0)
-            all_default = np.concatenate(all_default, axis=0)
-            all_moe_rw = np.concatenate(all_moe_rw, axis=0)
-    
-        if input_was_string:
-            all_embeddings = all_embeddings[0]
-        if get_cache:
-            return all_embeddings, all_kv_caches
-        
-        # Ensure all variables are PyTorch tensors before using torch operations
-        if isinstance(all_embeddings, np.ndarray):
-            all_embeddings = torch.from_numpy(all_embeddings)
+       
+        all_embeddings = np.concatenate(all_embeddings, axis=0)
+        all_embeddings = torch.from_numpy(all_embeddings)
 
-        if isinstance(all_default, np.ndarray):
-            all_default = torch.from_numpy(all_default)
-
-        if isinstance(all_moe_rw, np.ndarray):
-            all_moe_rw = torch.from_numpy(all_moe_rw)
+        # mean = all_embeddings.mean(dim=0, keepdim=True)
+        # std = all_embeddings.std(dim=0, keepdim=True)
+        # all_embeddings = (all_embeddings - mean) / (std + 1e-8)
 
         all_embeddings = torch.where(torch.isnan(all_embeddings), torch.zeros_like(all_embeddings), all_embeddings)
-        all_default = torch.where(torch.isnan(all_default), torch.zeros_like(all_default), all_default)
-        all_moe_rw = torch.where(torch.isnan(all_moe_rw), torch.zeros_like(all_moe_rw), all_moe_rw)
-        
         all_embeddings = all_embeddings.cpu().numpy()
-        all_default = all_default.cpu().numpy()
-        all_moe_rw = all_moe_rw.cpu().numpy()
+   
+        return all_embeddings
+
+        #     outputs = self.model(**prompts, output_hidden_states=True, return_dict=True)                    
+        #     sent_emb = outputs
+        #     sent_emb = sent_emb.cpu()
+            
+        #     lst_token_emb = outputs.hidden_states[-1][:, -1, :].cpu()# [25,128, 63, 2048] -> [128, 2048]
+            
+        #     lst_token_rw = sent_emb[:, :, -1, :] #[128, 24, 63, 60] -> [128, 24, 60]
+        #     lst_token_rw = torch.cat([lst_token_rw[:, i, :] for i in range(lst_token_rw.shape[1])], dim=1) #[128, 1440]
+            
+        #     if kwargs['emb_info'] == 'HS':
+        #         embeddings = lst_token_emb
+        #     elif kwargs['emb_info'] == 'RW':
+        #         embeddings = lst_token_rw
+        #     elif kwargs['emb_info'] == 'MoEE':
+        #         embeddings = torch.cat([lst_token_emb, lst_token_rw], dim=1) #[128, 3488]
+                
+        #     # if kwargs['emb_info'] != 'HS':  
+        #     #     mean = embeddings.mean(dim=0, keepdim=True)
+        #     #     std = embeddings.std(dim=0, keepdim=True)
+        #     #     embeddings = (embeddings - mean) / (std + 1e-8)
+                
+        #     #     mean = lst_token_emb.mean(dim=0, keepdim=True)
+        #     #     std = lst_token_emb.std(dim=0, keepdim=True)
+        #     #     lst_token_emb = (lst_token_emb - mean) / (std + 1e-8)
+                
+        #     #     mean = lst_token_rw.mean(dim=0, keepdim=True)
+        #     #     std = lst_token_rw.std(dim=0, keepdim=True)
+        #     #     lst_token_rw = (lst_token_rw - mean) / (std + 1e-8)
+
+            
+        #     mean = embeddings.mean(dim=0, keepdim=True)
+        #     std = embeddings.std(dim=0, keepdim=True)
+        #     embeddings = (embeddings - mean) / (std + 1e-8)
+            
+        #     mean = lst_token_emb.mean(dim=0, keepdim=True)
+        #     std = lst_token_emb.std(dim=0, keepdim=True)
+        #     lst_token_emb = (lst_token_emb - mean) / (std + 1e-8)
+            
+        #     mean = lst_token_rw.mean(dim=0, keepdim=True)
+        #     std = lst_token_rw.std(dim=0, keepdim=True)
+        #     lst_token_rw = (lst_token_rw - mean) / (std + 1e-8)
+
+        #     all_embeddings.append(embeddings.cpu().numpy())
+        #     all_default.append(lst_token_emb.cpu().numpy())
+        #     all_moe_rw.append(lst_token_rw.cpu().numpy())
+
+        # try:
+        #     all_embeddings = torch.cat(all_embeddings, dim=0)
+        #     all_default = torch.cat(all_default, dim=0)
+        #     all_moe_rw = torch.cat(all_moe_rw, dim=0)
+        # except:
+        #     all_embeddings = np.concatenate(all_embeddings, axis=0)
+        #     all_default = np.concatenate(all_default, axis=0)
+        #     all_moe_rw = np.concatenate(all_moe_rw, axis=0)
+    
+        # if input_was_string:
+        #     all_embeddings = all_embeddings[0]
+        # if get_cache:
+        #     return all_embeddings, all_kv_caches
         
-        return all_embeddings, all_default, all_moe_rw
+        # # Ensure all variables are PyTorch tensors before using torch operations
+        # if isinstance(all_embeddings, np.ndarray):
+        #     all_embeddings = torch.from_numpy(all_embeddings)
+
+        # if isinstance(all_default, np.ndarray):
+        #     all_default = torch.from_numpy(all_default)
+
+        # if isinstance(all_moe_rw, np.ndarray):
+        #     all_moe_rw = torch.from_numpy(all_moe_rw)
+
+        # all_embeddings = torch.where(torch.isnan(all_embeddings), torch.zeros_like(all_embeddings), all_embeddings)
+        # all_default = torch.where(torch.isnan(all_default), torch.zeros_like(all_default), all_default)
+        # all_moe_rw = torch.where(torch.isnan(all_moe_rw), torch.zeros_like(all_moe_rw), all_moe_rw)
+        
+        # all_embeddings = all_embeddings.cpu().numpy()
+        # all_default = all_default.cpu().numpy()
+        # all_moe_rw = all_moe_rw.cpu().numpy()
+        
+        # return all_embeddings, all_default, all_moe_rw

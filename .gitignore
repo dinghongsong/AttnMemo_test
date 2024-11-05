@@ -7,3 +7,5 @@ __pycache__/
 *.pt
 *.json
 *.npy
+/database/Llama-3.2-3B-Instruct/APMsDB
+/database/Llama-3.2-3B-Instruct/HiddenStatesDB

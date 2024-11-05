@@ -1085,7 +1085,7 @@ SET_TO_FEWSHOT_PROMPT = {
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--base_model', default="GritLM/GritLM-7B", type=str)
-    parser.add_argument('--attn_implementation', default='sdpa', type=str, help="eager/sdpa/flash_attention_2")
+    parser.add_argument('--attn_implementation', default='eager', type=str, help="eager/sdpa/flash_attention_2")
     parser.add_argument('--attn', default='bbcc', type=str, help="only first two letters matter for embedding")
     parser.add_argument('--task_types', default=None, help="Comma separated. Default is None i.e. running all tasks")
     parser.add_argument('--task_names', default=None, help="Comma separated. Default is None i.e. running all tasks")
@@ -1116,6 +1116,15 @@ def get_args():
     parser.add_argument('--similarity_weights', type=float, default=1.0)
     
     parser.add_argument('--ablation', type=int, default=-1) # 1 for averaging pooling of moe_rw
+
+    #################################  attn memo
+    parser.add_argument('--is_attn_memo', action='store_true')
+    parser.add_argument('--collect_hiddenstates_apms', action='store_true')
+    parser.add_argument('--save_dir', default=None, type=str)
+    parser.add_argument('--threshold', type=float, default=0.99, help='The threshold to decide whether to use attn replacement.')
+    parser.add_argument('--training_epoch', type=int, default=6,  help='The epoch of training embedding model and generating vector DB')
+    parser.add_argument('--unreplace_layer', type=int, default=0,  help='The layer that is not replaced by attn memo from 0 ~ unreplace_layer')
+
     
     return parser.parse_args()
 
@@ -1145,6 +1154,15 @@ if __name__ == '__main__':
         "pooling_method": args.pooling_method,
         "attn_implementation": args.attn_implementation,
         "attn": args.attn,
+        ##################################
+        "collect_hiddenstates_apms": args.collect_hiddenstates_apms,
+        "save_dir": args.save_dir,
+        "is_attn_memo": args.is_attn_memo,
+        "threshold": args.threshold,
+        "training_epoch": args.training_epoch,
+        "unreplace_layer": args.unreplace_layer,
+
+
     }
 
     if args.pipeline_parallel:
@@ -1185,7 +1203,7 @@ if __name__ == '__main__':
         
         if args.max_length is not None:
             model.encode = partial(model.encode, max_length=args.max_length)
-
+        tasks = [('STS12', 'STS')]
         for (task_name, task_type) in tasks:
             
             if task_name in ['MSMARCOv2', 'BigPatentClustering']:
@@ -1207,7 +1225,7 @@ if __name__ == '__main__':
                             continue
                         instruction = SET_TO_TASK_TO_DS_TO_PROMPT[args.instruction_set][task_type][true_task_name]
                     else:
-                        instruction = SET_TO_TASK_TO_DS_TO_PROMPT[args.instruction_set][task_type][task_name]
+                        instruction = SET_TO_TASK_TO_DS_TO_PROMPT[args.instruction_set][task_type][task_name] #
                 if isinstance(instruction, dict):
                     if args.num_shots is not None:
                         instruction = {
@@ -1221,7 +1239,7 @@ if __name__ == '__main__':
                         instruction = instruction + SET_TO_FEWSHOT_PROMPT[args.instruction_set]["Other"].format(
                             *SET_TO_TASK_TO_DS_TO_SHOTS[args.instruction_set][task_type][task_name]
                         )
-                    instruction = NAME_TO_FUNC[args.instruction_format](instruction.strip(": \n"))
+                    instruction = NAME_TO_FUNC[args.instruction_format](instruction.strip(": \n")) #
                 print(f"{model_name} instruction for {task_name}: ", instruction)
                 if isinstance(instruction, dict):
                     model.encode_queries = partial(model.encode_queries, instruction=instruction['query'])
@@ -1229,6 +1247,7 @@ if __name__ == '__main__':
                 else:
                     model.encode = partial(model.encode, instruction=instruction)
             eval_splits = ["test" if task_name not in ['MSMARCO'] else 'dev']
+            # eval_splits = ["train"] #
             evaluation = MTEB(tasks=[task_name], task_langs=['en'])
            
             
@@ -1239,10 +1258,11 @@ if __name__ == '__main__':
                 save_qrels=args.save_qrels,
                 top_k=args.top_k,
                 overwrite_results=args.overwrite_results,
-                output_folder=f"mteb_results_ablation/{task_type}/{args.base_model}_{args.use_4bit}_{task_name}_{args.do_pca}_{args.pca_dim}_{args.emb_info}_{args.embed_method}_{args.no_instruction}_{args.similarity_ensemble}_{args.similarity_weights}_{args.ablation}", 
+                # output_folder=f"mteb_results_ablation/{task_type}/{args.base_model}_{args.use_4bit}_{task_name}_{args.do_pca}_{args.pca_dim}_{args.emb_info}_{args.embed_method}_{args.no_instruction}_{args.similarity_ensemble}_{args.similarity_weights}_{args.ablation}", 
+                output_folder=f"mteb_results_ablation/{task_type}/{args.base_model}_{task_name}_threshold{args.threshold}_unreplace_layer{args.unreplace_layer}", 
                 encode_kwargs = {'do_pca': args.do_pca, 'pca_dim': args.pca_dim, 'emb_info': args.emb_info, 'embed_method': args.embed_method, 'batch_size': args.batch_size, 'similarity_ensemble': args.similarity_ensemble, 'similarity_weights': args.similarity_weights},
             )
         
-        
+            
             if results == []:
                 continue

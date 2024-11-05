@@ -270,10 +270,10 @@ class MTEB:
     def run(
         self,
         model: SentenceTransformer | Encoder,
-        verbosity: int = 1,
+        verbosity: int = 2,
         output_folder: str | None = "results",
         eval_splits=None,
-        overwrite_results: bool = False,
+        overwrite_results: bool = True,
         raise_error: bool = True,
         co2_tracker: bool = False,
         encode_kwargs: dict[str, Any] = {},
@@ -314,8 +314,8 @@ class MTEB:
         meta = self.create_model_meta(model)
         output_path = self.create_output_folder(meta, output_folder)
 
-        if output_path:
-            self._save_model_metadata(meta, output_path)
+        # if output_path:
+        #     self._save_model_metadata(meta, output_path)
 
         # Run selected tasks
         logger.info(f"\n\n## Evaluating {len(self.tasks)} tasks:")
@@ -472,7 +472,7 @@ class MTEB:
         model_revision: str = model_meta.revision  # type: ignore
         model_path_name = model_meta.model_name_as_path()
 
-        output_path = Path(output_folder) / model_path_name / model_revision
+        output_path = Path(output_folder) #/ model_path_name / model_revision
         output_path.mkdir(parents=True, exist_ok=True)
         return output_path
 

@@ -40,14 +40,23 @@ def model_encode(
             kwargs.pop("prompt_name")
     logger.info(f"Encoding {len(sentences)} sentences.")
 
-    embeddings, default, moe_rw = model.encode(sentences, **kwargs)
+
+    embeddings = model.encode(sentences, **kwargs)
     if isinstance(embeddings, torch.Tensor):
         embeddings = embeddings.cpu().detach().float()
-    if isinstance(default, torch.Tensor):
-        default = default.cpu().detach().float()
-    if isinstance(moe_rw, torch.Tensor):
-        moe_rw = moe_rw.cpu().detach().float()
         
     print('embeddings.shape: ', embeddings.shape)
 
-    return np.asarray(embeddings), np.asarray(default), np.asarray(moe_rw) 
+    return np.asarray(embeddings)
+
+    # embeddings, default, moe_rw = model.encode(sentences, **kwargs)
+    # if isinstance(embeddings, torch.Tensor):
+    #     embeddings = embeddings.cpu().detach().float()
+    # if isinstance(default, torch.Tensor):
+    #     default = default.cpu().detach().float()
+    # if isinstance(moe_rw, torch.Tensor):
+    #     moe_rw = moe_rw.cpu().detach().float()
+        
+    # print('embeddings.shape: ', embeddings.shape)
+
+    # return np.asarray(embeddings), np.asarray(default), np.asarray(moe_rw) 
